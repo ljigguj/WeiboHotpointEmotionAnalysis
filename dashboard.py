@@ -6,12 +6,16 @@ import os
 import random
 from datetime import datetime, timedelta
 
+import subprocess
+import sys
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from weibo_hot_topics import fetch_hot_topics, format_heat, FALLBACK_TOPICS
+
+REAL_DATA_FILE = "hot_comments_labeled.csv"   # pipeline.py 输出的真实数据
 
 # ===================== 页面基础配置 =====================
 st.set_page_config(
@@ -335,6 +339,48 @@ DAY_ORDER_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周
 
 
 # ===================== 数据生成 =====================
+def load_data(topic_names: list) -> tuple:
+    """
+    数据加载策略：
+      1. 优先加载 hot_comments_labeled.csv（pipeline.py 采集的真实数据）
+      2. 若文件不存在或话题不匹配，则回退到演示数据
+    返回 (DataFrame, source)，source = "real" | "demo"
+    """
+    if os.path.exists(REAL_DATA_FILE):
+        try:
+            df = pd.read_csv(REAL_DATA_FILE, encoding="utf-8-sig", parse_dates=["timestamp", "date"])
+            # 检查必要列是否存在
+            need = {"topic", "text", "emotion", "confidence", "timestamp"}
+            if not need.issubset(df.columns):
+                raise ValueError("列缺失")
+            if df.empty:
+                raise ValueError("文件为空")
+
+            # 补全可选列（旧版文件可能缺少）
+            if "id" not in df.columns:
+                df.insert(0, "id", range(1, len(df) + 1))
+            if "date" not in df.columns:
+                df["date"] = pd.to_datetime(df["timestamp"]).dt.normalize()
+            if "hour" not in df.columns:
+                df["hour"] = pd.to_datetime(df["timestamp"]).dt.hour
+            if "day_of_week" not in df.columns:
+                df["day_of_week"] = pd.to_datetime(df["timestamp"]).dt.strftime("%A")
+            if "day_cn" not in df.columns:
+                _D = {"Monday":"周一","Tuesday":"周二","Wednesday":"周三",
+                      "Thursday":"周四","Friday":"周五","Saturday":"周六","Sunday":"周日"}
+                df["day_cn"] = df["day_of_week"].map(_D)
+            if "emotion_id" not in df.columns:
+                df["emotion_id"] = df["emotion"].map({"积极": 0, "中性": 1, "消极": 2})
+
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            df["date"]      = pd.to_datetime(df["date"])
+            return df, "real"
+        except Exception as e:
+            st.warning(f"真实数据加载失败（{e}），已切换演示数据")
+
+    return generate_demo_data(tuple(topic_names), 2000), "demo"
+
+
 @st.cache_data(show_spinner=False)
 def generate_demo_data(topic_names: tuple, n: int = 2000) -> pd.DataFrame:
     """
@@ -928,8 +974,8 @@ def main():
         hot_topics  = get_hot_topics_cached()
     topic_names = [t["name"] for t in hot_topics]
 
-    # ── 基于当前热搜生成演示数据 ──────────────────────
-    df_full = generate_demo_data(tuple(topic_names), 2000)
+    # ── 加载数据（优先真实，其次演示）────────────────
+    df_full, data_source = load_data(topic_names)
 
     # ===================== 侧边栏 =====================
     with st.sidebar:
@@ -947,12 +993,48 @@ def main():
                 unsafe_allow_html=True,
             )
 
-        # 刷新按钮
+        # 刷新热搜按钮
         if st.button("🔄 刷新热搜", use_container_width=True):
             get_hot_topics_cached.clear()
             st.rerun()
-
         st.caption(f"每10分钟自动更新 · {datetime.now().strftime('%H:%M')} 刷新")
+
+        st.markdown("---")
+
+        # ── 数据来源 & 采集按钮 ───────────────────────
+        st.subheader("📡 数据来源")
+        if data_source == "real":
+            mtime = datetime.fromtimestamp(os.path.getmtime(REAL_DATA_FILE))
+            st.success(f"✅ 真实爬取数据\n\n采集时间：{mtime.strftime('%m-%d %H:%M')}")
+        else:
+            st.warning("🟡 演示模拟数据\n\n点击下方按钮采集真实评论")
+
+        # 采集按钮：后台启动 pipeline.py
+        if "pipeline_proc" not in st.session_state:
+            st.session_state.pipeline_proc = None
+
+        proc = st.session_state.pipeline_proc
+        is_running = proc is not None and proc.poll() is None
+
+        if is_running:
+            st.info("⏳ 正在采集中，完成后刷新页面即可看到真实数据…")
+            if st.button("🔃 刷新查看结果", use_container_width=True):
+                st.cache_data.clear()
+                st.rerun()
+        else:
+            col_a, col_b = st.columns(2)
+            with col_a:
+                n_max = st.number_input("每话题条数", 50, 1000, 200, 50)
+            with col_b:
+                st.write("")  # 占位对齐
+                st.write("")
+            if st.button("📡 采集真实数据", type="primary", use_container_width=True):
+                st.session_state.pipeline_proc = subprocess.Popen(
+                    [sys.executable, "pipeline.py", "--max", str(int(n_max))],
+                    cwd=os.path.dirname(os.path.abspath(__file__)),
+                )
+                st.rerun()
+
         st.markdown("---")
 
         # ── 数据过滤 ──────────────────────────────────
