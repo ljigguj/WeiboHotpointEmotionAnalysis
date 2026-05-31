@@ -163,23 +163,11 @@ def _load_cookies_to_driver(driver: webdriver.Chrome):
 
 
 # ──────────────────────────────────────────────────
-# 单话题爬取
+# 单话题爬取（分页翻页版）
 # ──────────────────────────────────────────────────
-# 微博搜索结果页的多套候选选择器（兼容页面结构变化）
-_TEXT_SELECTORS = [
-    "div.card-feed .txt",
-    "p.txt",
-    "div.WB_text",
-    "div[class*='detail'] p",
-    "div[class*='content'] p",
-]
-_TIME_SELECTORS = [
-    "p.from a",
-    "div.card-feed .from a",
-    "a.WB_from",
-    "span.time",
-]
-
+# 诊断确认：微博搜索结果为分页结构（每页固定 ~15 条），
+# 滚动无法加载更多；必须通过 &page=N 逐页获取。
+# 正确选择器：div.card-wrap > p.txt  /  div.card-feed .from a
 
 def scrape_one_topic(
     driver: webdriver.Chrome,
@@ -188,72 +176,97 @@ def scrape_one_topic(
     max_n: int = 200,
 ) -> List[Dict]:
     """
-    爬取单个话题的微博文本与时间。
+    逐页翻页爬取话题搜索结果，每页约 15 条。
     返回 list of dict: {topic, text, timestamp}
     """
-    print(f"  → 爬取「{topic_name}」（目标 {max_n} 条）")
+    print(f"  --> 爬取 [{topic_name}]  目标 {max_n} 条")
     results: List[Dict] = []
     seen: set = set()
 
-    try:
-        driver.get(search_url)
-        # 等待任意一个文本选择器出现
-        for sel in _TEXT_SELECTORS:
-            try:
-                WebDriverWait(driver, 8).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, sel))
-                )
-                break
-            except TimeoutException:
-                continue
-    except Exception as e:
-        print(f"  [错误] 页面加载异常: {e}")
-        return results
+    # 去掉 URL 中已有的 page 参数，保留其余参数
+    base_url = re.sub(r"[&?]page=\d+", "", search_url)
 
-    # 检查是否被重定向到登录页
-    if "passport.weibo.com" in driver.current_url or "login" in driver.current_url:
-        print(f"  [提示] 该话题需要登录才能查看，跳过")
-        return results
+    # 估算最多需要多少页（每页约 15 条，多预留 5 页）
+    max_pages = min(max_n // 15 + 5, 50)
 
-    no_new_streak = 0
-    while len(results) < max_n and no_new_streak < 4:
+    for page_num in range(1, max_pages + 1):
+        page_url = f"{base_url}&page={page_num}"
+
+        # ── 加载页面 ──
+        try:
+            driver.get(page_url)
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "div.card-wrap"))
+            )
+            time.sleep(1)                          # 等待动态内容渲染
+        except TimeoutException:
+            print(f"     第{page_num}页超时，停止")
+            break
+        except Exception as e:
+            print(f"     第{page_num}页错误: {e}")
+            break
+
+        # ── 检查是否跳转到登录页 ──
+        if "passport.weibo.com" in driver.current_url:
+            print("     需要登录，停止")
+            break
+
+        # ── 检查"无结果"文字 ──
+        src = driver.page_source
+        if "没有找到相关微博" in src or "抱歉，未找到" in src:
+            print(f"     第{page_num}页无结果，停止")
+            break
+
+        # ── 提取本页所有卡片 ──
+        cards = driver.find_elements(By.CSS_SELECTOR, "div.card-wrap")
+        if not cards:
+            print(f"     第{page_num}页无卡片，停止")
+            break
+
         new_cnt = 0
+        for card in cards:
+            # 帖子正文：p.txt
+            text = ""
+            try:
+                text = clean_text(
+                    card.find_element(By.CSS_SELECTOR, "p.txt").text
+                )
+            except NoSuchElementException:
+                pass
 
-        # ── 提取文本 ──
-        texts_on_page: List[str] = []
-        for sel in _TEXT_SELECTORS:
-            els = driver.find_elements(By.CSS_SELECTOR, sel)
-            if els:
-                texts_on_page = [clean_text(e.text) for e in els]
-                break
-
-        # ── 尝试同时提取时间 ──
-        times_on_page: List[str] = []
-        for sel in _TIME_SELECTORS:
-            els = driver.find_elements(By.CSS_SELECTOR, sel)
-            if els:
-                times_on_page = [e.text.strip() for e in els]
-                break
-
-        for idx, text in enumerate(texts_on_page):
             if len(text) < 4 or text in seen:
                 continue
-            seen.add(text)
-            # 尽量取对应时间，没有则随机分配近 7 天
-            time_str = times_on_page[idx] if idx < len(times_on_page) else ""
-            ts = parse_weibo_time(time_str) if time_str else (
-                datetime.now() - timedelta(seconds=random.randint(0, 7 * 24 * 3600))
+
+            # 发帖时间：card 内 .from a 的第一个链接文字
+            ts = datetime.now() - timedelta(
+                seconds=random.randint(0, 7 * 24 * 3600)
             )
+            try:
+                time_text = card.find_element(
+                    By.CSS_SELECTOR, "div.card-feed .from a, p.from a"
+                ).text.strip()
+                if time_text:
+                    ts = parse_weibo_time(time_text)
+            except NoSuchElementException:
+                pass
+
+            seen.add(text)
             results.append({"topic": topic_name, "text": text, "timestamp": ts})
             new_cnt += 1
+
             if len(results) >= max_n:
                 break
 
-        no_new_streak = 0 if new_cnt > 0 else no_new_streak + 1
+        print(f"     第{page_num:>2}页: +{new_cnt:>2}条  累计 {len(results)} 条")
 
-        # 下拉加载更多
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(2)
+        if new_cnt == 0:
+            print(f"     第{page_num}页无新内容，停止")
+            break
+
+        if len(results) >= max_n:
+            break
+
+        time.sleep(1.5)                            # 礼貌延迟，降低被封概率
 
     print(f"  [OK] [{topic_name}] 共收集 {len(results)} 条")
     return results
